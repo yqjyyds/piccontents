@@ -3,13 +3,17 @@ import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
 import '../models/app_settings.dart';
 import '../models/photo.dart';
 import '../models/photo_filter.dart';
 import '../services/database_service.dart';
+import '../services/diagnostics.dart';
 import '../services/scanner_service.dart';
+import '../services/volume_identity.dart';
+import '../utils/index_paths.dart';
 import '../widgets/filter_panel.dart';
 import '../widgets/folder_breadcrumb.dart';
 import '../widgets/folder_grid.dart';
@@ -48,6 +52,19 @@ class _HomePageState extends State<HomePage> {
 
   /// 已索引的根目录。
   List<String> _rootFolders = const [];
+
+  /// 索引目录的自定义显示名（路径 → 名称）。
+  Map<String, String> _folderNames = const {};
+
+  /// 已归档（当前未接入）的硬盘索引。
+  List<ArchivedLibrarySummary> _archivedLibraries = const [];
+
+  /// 当前活动库的路径 → id，用于按硬盘隔离查询。
+  Map<String, int> _activeLibraryIds = const {};
+
+  /// 当前正在浏览的归档库；null 表示浏览活动索引。
+  int? _archivedLibraryId;
+
   Map<String, int> _folderCounts = const {};
   int _totalCount = 0;
 
@@ -105,19 +122,38 @@ class _HomePageState extends State<HomePage> {
   // ------------------------------------------------------------------ 数据
 
   Future<void> _reloadFolders() async {
-    final folders = await _db.getFolders();
-    final counts = await _db.folderCounts();
-    final total = await _db.totalCount();
-    if (!mounted) return;
-    setState(() {
-      _rootFolders = folders;
-      _folderCounts = counts;
-      _totalCount = total;
-      // 根目录被移除后，退回到全部照片。
-      if (_scopePath != null && !_isUnderAnyRoot(_scopePath!)) {
-        _scopePath = null;
-      }
-    });
+    try {
+      final folders = await _db.getFolders();
+      final names = await _db.folderDisplayNames();
+      final counts = await _db.folderCounts();
+      final total = await _db.totalCount();
+      final archived = await _db.archivedLibraries();
+      final libraryIds = await _db.activeLibraryIds();
+      if (!mounted) return;
+      setState(() {
+        _rootFolders = folders;
+        _folderNames = names;
+        _folderCounts = counts;
+        _totalCount = total;
+        _archivedLibraries = archived;
+        _activeLibraryIds = libraryIds;
+        // 正在浏览的归档被删除后，退回到全部照片。
+        if (_archivedLibraryId != null &&
+            !archived.any((library) => library.id == _archivedLibraryId)) {
+          _archivedLibraryId = null;
+        }
+        // 根目录被移除后，退回到全部照片（浏览归档时不受活动目录影响）。
+        if (_archivedLibraryId == null &&
+            _scopePath != null &&
+            !_isUnderAnyRoot(_scopePath!)) {
+          _scopePath = null;
+        }
+      });
+    } catch (e, stack) {
+      _logError('Folders', e, stack);
+      if (!mounted) return;
+      _showMessage('读取索引目录失败：$e');
+    }
   }
 
   bool _isUnderAnyRoot(String path) {
@@ -147,6 +183,39 @@ class _HomePageState extends State<HomePage> {
     return best;
   }
 
+  /// 当前正在浏览的归档库；未选择归档时返回 null。
+  ArchivedLibrarySummary? get _archivedLibrary {
+    final id = _archivedLibraryId;
+    if (id == null) return null;
+    for (final library in _archivedLibraries) {
+      if (library.id == id) return library;
+    }
+    return null;
+  }
+
+  /// 当前浏览范围对应的库 id。
+  ///
+  /// - 归档浏览：归档库 id；
+  /// - 某个根目录：该根目录的活动库 id（即使另一块盘挂同一盘符也不会串）；
+  /// - 全部照片：null，表示不限制库。
+  int? get _scopeLibraryId {
+    final archivedId = _archivedLibraryId;
+    if (archivedId != null) return archivedId;
+    final scope = _scopePath;
+    if (scope == null) return null;
+    int? bestId;
+    var bestLength = -1;
+    for (final entry in _activeLibraryIds.entries) {
+      final root = entry.key;
+      if ((scope == root || _isInside(scope, root)) &&
+          root.length > bestLength) {
+        bestId = entry.value;
+        bestLength = root.length;
+      }
+    }
+    return bestId;
+  }
+
   /// 同时刷新照片列表与子文件夹列表。
   Future<void> _reloadContent() async {
     await _reloadPhotos();
@@ -164,8 +233,10 @@ class _HomePageState extends State<HomePage> {
     final scope = _scopePath;
     final sort = _sort;
     final filter = _filter;
+    final libraryId = _scopeLibraryId;
     try {
       final photos = await _db.queryPhotos(
+        libraryId: libraryId,
         scopePath: scope,
         keyword: keyword,
         filter: filter,
@@ -174,6 +245,7 @@ class _HomePageState extends State<HomePage> {
         limit: _pageSize,
       );
       final count = await _db.countPhotos(
+        libraryId: libraryId,
         scopePath: scope,
         keyword: keyword,
         filter: filter,
@@ -187,7 +259,8 @@ class _HomePageState extends State<HomePage> {
         _visibleCount = count;
         _loading = false;
       });
-    } catch (e) {
+    } catch (e, stack) {
+      _logError('QueryPhotos', e, stack);
       if (!mounted) return;
       setState(() => _loading = false);
       _showMessage('读取数据库失败：$e');
@@ -197,36 +270,59 @@ class _HomePageState extends State<HomePage> {
   /// 后台重新读取可筛选的相机型号 / 镜头 / 参数范围，以及滑条极值设置。
   Future<void> _reloadFilterOptions() async {
     try {
-      final data = await _db.loadFilterOptions();
+      final data = await _db.loadFilterOptions(libraryId: _scopeLibraryId);
       final bounds = await _db.loadSliderBounds();
       if (!mounted) return;
       setState(() {
         _sliderBounds = bounds;
         _filterOptions = resolveFilterOptions(data, bounds);
       });
-    } catch (_) {
+    } catch (e, stack) {
+      _logError('FilterOptions', e, stack);
       // 筛选选项加载失败不影响主流程。
     }
   }
 
   Future<void> _openSettings() async {
-    final result = await showDialog<SliderBoundsResult>(
+    final result = await showDialog<SettingsResult>(
       context: context,
       builder: (context) => SliderBoundsDialog(
         effectiveOptions: _filterOptions,
         currentBounds: _sliderBounds,
+        dataPath: _db.dbPath,
       ),
     );
     if (result == null) return;
 
     setState(() => _busy = true);
+    final newDir = result.newDataDir;
+    final previousPath = _db.dbPath;
+    var relocated = false;
     try {
-      await _db.saveSliderBounds(result.bounds);
-      await _reloadFilterOptions();
+      if (result.boundsChanged) {
+        await _db.saveSliderBounds(result.bounds);
+        await _reloadFilterOptions();
+      }
+      if (newDir != null) {
+        await _db.relocateTo(newDir);
+        relocated = previousPath != _db.dbPath;
+        // 迁移后重新加载，确保界面用的是新库里的数据。
+        await _reloadFolders();
+        await _reloadFilterOptions();
+        await _reloadContent();
+      }
       if (!mounted) return;
-      _showMessage(result.bounds == null ? '已恢复为按实际数据范围' : '滑条极值已保存');
-    } catch (e) {
-      _showMessage('保存设置失败：$e');
+      if (newDir != null) {
+        _showMessage(
+          relocated ? '索引已迁移到 ${_db.dbPath}' : '索引仍保存在 ${_db.dbPath}',
+        );
+      } else if (result.boundsChanged) {
+        _showMessage(result.bounds == null ? '已恢复为按实际数据范围' : '滑条极值已保存');
+      }
+    } catch (e, stack) {
+      _logError('Settings', e, stack);
+      if (!mounted) return;
+      await _showErrorDialog('保存设置失败', '$e', stack);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -249,13 +345,19 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _reloadSubFolders() async {
     try {
+      final archived = _archivedLibrary;
+      final allScope = _archivedLibraryId == null && _scopePath == null;
       final folders = await _db.listSubFolders(
+        libraryId: _scopeLibraryId,
+        // 「全部照片」的文件夹视图只统计当前接入的库。
+        libraryIds: allScope ? _activeLibraryIds.values.toSet() : null,
         scope: _scopePath,
-        roots: _rootFolders,
+        roots: archived == null ? _rootFolders : [archived.path],
       );
       if (!mounted) return;
       setState(() => _subFolders = folders);
-    } catch (e) {
+    } catch (e, stack) {
+      _logError('SubFolders', e, stack);
       if (!mounted) return;
       setState(() => _subFolders = const []);
       _showMessage('读取文件夹失败：$e');
@@ -277,6 +379,7 @@ class _HomePageState extends State<HomePage> {
     setState(() {});
     try {
       final photos = await _db.queryPhotos(
+        libraryId: _scopeLibraryId,
         scopePath: _scopePath,
         keyword: _keyword,
         filter: _filter,
@@ -314,12 +417,56 @@ class _HomePageState extends State<HomePage> {
 
   /// 切换浏览位置。[mode] 不为空时同时切换视图。
   void _navigateTo(String? path, {ViewMode? mode}) {
+    final wasArchived = _archivedLibraryId != null;
+    setState(() {
+      _archivedLibraryId = null;
+      _scopePath = path;
+      if (mode != null) _viewMode = mode;
+      _selected = null;
+      _subFolders = const [];
+    });
+    if (wasArchived) _reloadFilterOptions();
+    _reloadContent();
+  }
+
+  /// 在当前位置内切换目录；浏览归档库时保持在归档数据源里。
+  void _navigateScope(String? path, {ViewMode? mode}) {
+    if (_archivedLibraryId == null) {
+      _navigateTo(path, mode: mode);
+      return;
+    }
     setState(() {
       _scopePath = path;
       if (mode != null) _viewMode = mode;
       _selected = null;
       _subFolders = const [];
     });
+    _reloadContent();
+  }
+
+  /// 打开一份归档索引（离线浏览，不改变活动索引）。
+  void _openArchived(int id) {
+    setState(() {
+      _archivedLibraryId = id;
+      _scopePath = null;
+      _viewMode = ViewMode.photos;
+      _selected = null;
+      _subFolders = const [];
+    });
+    _reloadFilterOptions();
+    _reloadContent();
+  }
+
+  /// 退出归档浏览，回到当前接入硬盘的全部照片。
+  void _openActiveScope() {
+    setState(() {
+      _archivedLibraryId = null;
+      _scopePath = null;
+      _viewMode = ViewMode.photos;
+      _selected = null;
+      _subFolders = const [];
+    });
+    _reloadFilterOptions();
     _reloadContent();
   }
 
@@ -334,20 +481,238 @@ class _HomePageState extends State<HomePage> {
   // ------------------------------------------------------------------ 扫描
 
   Future<void> _addFolder() async {
-    final path = await getDirectoryPath(confirmButtonText: '选择该文件夹');
+    debugPrint('[AddFolder] 开始选择文件夹');
+    final path = await _pickFolder();
     if (path == null) return;
-    await _db.addFolder(path);
-    await _reloadFolders();
+    // 磁盘根目录的写法不固定（C: / C:\ / c:/），统一后再入库和扫描。
+    final normalized = normalizeIndexRootPath(path);
+    debugPrint('[AddFolder] 已选择：$path → $normalized');
+
+    try {
+      // 盘符可能被不同硬盘重复使用，扫描前先确认这次接的是不是同一块盘。
+      final proceed = await _prepareRootForScan(normalized);
+      if (!proceed) return;
+      await _db.addFolder(normalized);
+      final identity = identifyVolume(normalized);
+      if (identity != null) await _db.setFolderVolume(normalized, identity);
+      await _reloadFolders();
+    } catch (e, stack) {
+      _logError('AddFolder', e, stack);
+      if (!mounted) return;
+      await _showErrorDialog('添加目录失败', '目录：$normalized\n\n$e', stack);
+      return;
+    }
+
     if (!mounted) return;
-    _navigateTo(p.normalize(path), mode: ViewMode.folders);
-    await _scanFolder(p.normalize(path));
+    _navigateTo(normalized, mode: ViewMode.folders);
+    await _scanFolder(normalized);
   }
 
-  Future<void> _scanFolder(String path, {bool resetCancel = true}) async {
+  /// 调用系统文件夹选择器。
+  ///
+  /// 返回 null 表示用户取消；选择器本身报错时会弹出错误详情，
+  /// 而不是像以前那样静默失败。
+  Future<String?> _pickFolder() async {
+    try {
+      final path = await getDirectoryPath(confirmButtonText: '选择该文件夹');
+      if (path == null) {
+        debugPrint('[AddFolder] 用户取消，或选择器未返回任何路径');
+        return null;
+      }
+      final trimmed = path.trim();
+      if (trimmed.isEmpty) {
+        throw StateError('文件夹选择器返回了空路径');
+      }
+      return trimmed;
+    } catch (e, stack) {
+      _logError('PickFolder', e, stack);
+      if (mounted) {
+        await _showErrorDialog(
+          '无法选择文件夹',
+          '系统文件夹选择器调用失败：\n$e\n\n'
+              '如果所选位置是网络位置或 OneDrive 等虚拟目录，'
+              '可以改为选择本机的普通文件夹后重试。',
+          stack,
+        );
+      }
+      return null;
+    }
+  }
+
+  // -------------------------------------------------- 硬盘身份与独立索引
+
+  /// 扫描前确认盘符上接的硬盘和索引记录是否一致。
+  ///
+  /// 返回 false 表示用户取消了本次操作；true 表示可以继续入库/扫描。
+  Future<bool> _prepareRootForScan(String path) async {
+    final identity = identifyVolume(path);
+    // 网络盘、无法识别的卷：沿用旧行为，不做拦截。
+    if (identity == null) return true;
+
+    final stored = await _db.folderVolume(path);
+    // 新目录：调用方入库时再记录卷身份。
+    if (stored == null) return true;
+    if (stored.matches(identity)) {
+      await _db.setFolderVolume(path, identity);
+      return true;
+    }
+
+    final archived = await _db.findArchivedLibrary(
+      path: path,
+      identity: identity,
+    );
+    if (archived != null) {
+      final count = await _db.archivedPhotoCount(archived.id);
+      if (!mounted) return false;
+      final choice = await _showChoiceDialog(
+        title: '检测到曾经索引过的硬盘',
+        message:
+            '$path 现在接入的是「${identity.displayName}」，'
+            '与现有索引所在的硬盘不是同一块。\n\n'
+            '找到这块硬盘之前的索引（$count 张照片）。'
+            '恢复后只需要增量扫描，不会重复处理。',
+        options: const {
+          'restore': '恢复旧索引并扫描',
+          'independent': '归档现有索引，重新扫描',
+          'cancel': '取消',
+        },
+      );
+      if (choice == 'restore') {
+        debugPrint('[Volume] 恢复归档索引：$path');
+        await _db.archiveFolder(path);
+        await _db.restoreLibrary(archived);
+        await _reloadFolders();
+        await _reloadContent();
+        return true;
+      }
+      if (choice == 'independent') {
+        debugPrint('[Volume] 归档现有索引并扫描新盘：$path');
+        await _db.archiveFolder(path);
+        await _db.addFolder(path);
+        await _db.setFolderVolume(path, identity);
+        await _reloadFolders();
+        await _reloadContent();
+        return true;
+      }
+      return false;
+    }
+
+    final reason = stored.isKnown ? '与索引时记录的硬盘不一致' : '现有索引没有记录硬盘信息，无法确认是不是同一块盘';
+    if (!mounted) return false;
+    final choice = await _showChoiceDialog(
+      title: '同一盘符上检测到另一块硬盘',
+      message:
+          '$path 现在接入的是「${identity.displayName}」，$reason。\n\n'
+          '作为独立硬盘：先把现有索引归档保存（不会动原图），再扫描这块盘；\n'
+          '合并：保留现有记录继续扫描。同名路径会被覆盖，扫描结束时'
+          '旧盘上已不存在的记录会被清理。',
+      options: const {
+        'independent': '作为独立硬盘',
+        'merge': '合并到现有索引',
+        'cancel': '取消',
+      },
+    );
+    if (choice == 'independent') {
+      debugPrint('[Volume] 视作独立硬盘：$path');
+      await _db.archiveFolder(path);
+      await _db.addFolder(path);
+      await _db.setFolderVolume(path, identity);
+      await _reloadFolders();
+      await _reloadContent();
+      return true;
+    }
+    if (choice == 'merge') {
+      debugPrint('[Volume] 合并到现有索引：$path');
+      await _db.setFolderVolume(path, identity);
+      return true;
+    }
+    return false;
+  }
+
+  /// 多选一对话框；返回被点击选项的 key，关闭时返回 null。
+  Future<String?> _showChoiceDialog({
+    required String title,
+    required String message,
+    required Map<String, String> options,
+  }) {
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: SizedBox(
+          width: 460,
+          child: SingleChildScrollView(child: Text(message)),
+        ),
+        actions: [
+          for (final entry in options.entries)
+            if (entry.key == 'cancel')
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, entry.key),
+                child: Text(entry.value),
+              )
+            else
+              FilledButton.tonal(
+                onPressed: () => Navigator.pop(dialogContext, entry.key),
+                child: Text(entry.value),
+              ),
+        ],
+      ),
+    );
+  }
+
+  /// 展示可复制的错误详情，避免异常只被打印到控制台。
+  Future<void> _showErrorDialog(
+    String title,
+    String message,
+    StackTrace? stack,
+  ) {
+    return showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: SizedBox(
+          width: 460,
+          child: SingleChildScrollView(
+            child: SelectableText(
+              message,
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              final detail = stack == null ? message : '$message\n\n$stack';
+              Clipboard.setData(ClipboardData(text: detail));
+              Navigator.pop(dialogContext);
+              _showMessage('错误详情已复制');
+            },
+            child: const Text('复制详情'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _scanFolder(
+    String path, {
+    bool resetCancel = true,
+    bool checkVolume = true,
+  }) async {
     if (_scanning) {
       _showMessage('已有扫描任务在进行中');
       return;
     }
+    if (checkVolume) {
+      final proceed = await _prepareRootForScan(path);
+      if (!proceed) return;
+      await _reloadFolders();
+    }
+    debugPrint('[Scan] 开始扫描：$path');
     setState(() {
       _scanning = true;
       if (resetCancel) _cancelRequested = false;
@@ -382,16 +747,52 @@ class _HomePageState extends State<HomePage> {
     await _reloadContent();
 
     if (error != null) {
+      _logError('Scan', error, null);
       _showMessage('扫描失败：$error');
       return;
     }
     if (summary == null) return;
-    final prefix = summary.cancelled ? '已取消' : '扫描完成';
-    _showMessage(
-      '$prefix：共 ${summary.total} 张，新增/更新 ${summary.indexed} 张，'
-      '跳过 ${summary.skipped} 张，失败 ${summary.failed} 张，'
-      '清理失效记录 ${summary.removed} 条',
+    final elapsedSeconds = summary.elapsedMs / 1000;
+    final secondsText = elapsedSeconds < 1
+        ? '${summary.elapsedMs}ms'
+        : '${elapsedSeconds.toStringAsFixed(1)}s';
+    debugPrint(
+      '[Scan] 用时 $secondsText，处理 ${summary.processed} 张，'
+      '${summary.photosPerSecond.toStringAsFixed(1)} 张/秒；'
+      '阶段耗时：${summary.timingsMs.entries.map((e) => '${e.key}=${e.value}ms').join(', ')}',
     );
+    // 从资源管理器启动时没有控制台，把性能数据也写进日志。
+    writeDiagnosticLog(
+      'ScanTiming',
+      '共 ${summary.total} 张（实际处理 ${summary.processed} 张），'
+          '用时 $secondsText，'
+          '${summary.photosPerSecond.toStringAsFixed(1)} 张/秒；'
+          '${summary.timingsMs.entries.map((e) => '${e.key}=${e.value}ms').join(', ')}',
+    );
+    final prefix = summary.diskError
+        ? '已中止'
+        : (summary.cancelled ? '已取消' : '扫描完成');
+    final skippedDirsText = summary.skippedDirs > 0
+        ? '，跳过 ${summary.skippedDirs} 个无权限目录'
+        : '';
+    final message =
+        '$prefix：共 ${summary.total} 张，新增/更新 ${summary.indexed} 张，'
+        '跳过 ${summary.skipped} 张，失败 ${summary.failed} 张，'
+        '清理失效记录 ${summary.removed} 条$skippedDirsText，用时 $secondsText';
+    _showMessage(message);
+    if (summary.diskError) {
+      await _showErrorDialog(
+        '扫描已中止：磁盘读取异常',
+        '$message\n\n'
+            '连续 ${summary.failed} 张照片读取失败，通常意味着硬盘有坏块，'
+            '或 USB 线材/接口不稳定。\n\n'
+            '建议：\n'
+            '1. 换一根 USB 数据线和另一个 USB 3.0 接口后重试；\n'
+            '2. 用 CrystalDiskInfo 查看 SMART 中的重映射扇区、待映射扇区；\n'
+            '3. 尽快把这块盘里重要的照片备份到其他硬盘。',
+        null,
+      );
+    }
   }
 
   Future<void> _removeFolder(String path) async {
@@ -400,16 +801,179 @@ class _HomePageState extends State<HomePage> {
       content: '将删除 $path 及其所有子文件夹下已索引的缩略图与元数据（不会删除原图）。是否继续？',
     );
     if (confirmed != true) return;
-    await _db.removeFolder(path);
-    if (!mounted) return;
-    setState(() {
-      _selected = null;
-      _filter = PhotoFilter.none;
-    });
-    await _reloadFolders();
-    await _reloadFilterOptions();
-    await _reloadContent();
-    _showMessage('已移除该文件夹的索引');
+    try {
+      await _db.removeFolder(path);
+      if (!mounted) return;
+      setState(() {
+        _selected = null;
+        _filter = PhotoFilter.none;
+      });
+      await _reloadFolders();
+      await _reloadFilterOptions();
+      await _reloadContent();
+      _showMessage('已移除该文件夹的索引');
+    } catch (e, stack) {
+      _logError('RemoveFolder', e, stack);
+      if (!mounted) return;
+      await _showErrorDialog('移除索引失败', '目录：$path\n\n$e', stack);
+    }
+  }
+
+  /// 修改索引目录的显示名。只影响界面，不重命名磁盘上的文件夹。
+  Future<void> _renameFolder(String path) async {
+    final controller = TextEditingController(
+      text: _folderNames[path] ?? _folderRealName(path),
+    );
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('重命名显示名'),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: controller,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: '显示名',
+                  helperText: '留空则恢复为真实文件夹名；不会改名磁盘上的文件夹',
+                  border: OutlineInputBorder(),
+                ),
+                onSubmitted: (value) => Navigator.pop(dialogContext, value),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                '实际路径：$path',
+                style: Theme.of(dialogContext).textTheme.labelSmall,
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (newName == null) return;
+
+    try {
+      await _db.setFolderDisplayName(path, newName);
+      await _reloadFolders();
+      if (!mounted) return;
+      _showMessage(newName.trim().isEmpty ? '已恢复为真实文件夹名' : '显示名已更新');
+    } catch (e, stack) {
+      _logError('RenameFolder', e, stack);
+      if (!mounted) return;
+      await _showErrorDialog('重命名失败', '目录：$path\n\n$e', stack);
+    }
+  }
+
+  /// 取路径最后一级作为文件夹名；盘符根（C:\）显示为「C:」。
+  static String _folderRealName(String path) {
+    final segments = path
+        .split(RegExp(r'[\\/]'))
+        .where((s) => s.isNotEmpty)
+        .toList();
+    return segments.isEmpty ? path : segments.last;
+  }
+
+  // ---------------------------------------------------------- 归档索引管理
+
+  static String _archivedName(ArchivedLibrary library) {
+    final display = library.displayName?.trim() ?? '';
+    if (display.isNotEmpty) return display;
+    final label = library.volumeLabel?.trim() ?? '';
+    if (label.isNotEmpty) return label;
+    return library.path;
+  }
+
+  /// 把归档库恢复成该路径的活动索引；原有活动索引会先归档。
+  Future<void> _restoreArchived(int id) async {
+    final library = await _db.libraryById(id);
+    if (library == null) return;
+    final name = _archivedName(library);
+    final count = await _db.archivedPhotoCount(id);
+    final identity = identifyVolume(library.path);
+    final attached = identity != null && library.matches(identity);
+
+    final confirmed = await _confirm(
+      title: '恢复归档索引',
+      content:
+          '将把「$name」（$count 张）恢复为主索引。\n\n'
+          '同一路径上当前的活动索引会先被归档保存，不会丢失。'
+          '${attached ? '' : '\n\n注意：当前盘符上的硬盘无法确认就是这块硬盘，'
+                    '恢复后先做离线浏览，扫描前请确认硬盘。'}',
+    );
+    if (confirmed != true) return;
+
+    setState(() => _busy = true);
+    try {
+      await _db.archiveFolder(library.path);
+      await _db.restoreLibrary(library);
+      if (!mounted) return;
+      setState(() {
+        _archivedLibraryId = null;
+        _scopePath = library.path;
+      });
+      await _reloadFolders();
+      await _reloadFilterOptions();
+      await _reloadContent();
+      _showMessage('已恢复「$name」的索引');
+    } catch (e, stack) {
+      _logError('RestoreArchive', e, stack);
+      if (!mounted) return;
+      await _showErrorDialog('恢复归档失败', '$e', stack);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// 删除归档索引（只删缩略图与元数据，不动原图）。
+  Future<void> _deleteArchived(int id) async {
+    final library = await _db.libraryById(id);
+    if (library == null) return;
+    final name = _archivedName(library);
+    final count = await _db.archivedPhotoCount(id);
+    final confirmed = await _confirm(
+      title: '删除归档索引',
+      content:
+          '将删除「$name」的 $count 张索引记录（缩略图与 EXIF 元数据，'
+          '不会删除原始照片）。是否继续？',
+    );
+    if (confirmed != true) return;
+
+    setState(() => _busy = true);
+    try {
+      await _db.deleteLibrary(id);
+      if (!mounted) return;
+      if (_archivedLibraryId == id) {
+        setState(() {
+          _archivedLibraryId = null;
+          _scopePath = null;
+        });
+      }
+      await _reloadFolders();
+      await _reloadFilterOptions();
+      await _reloadContent();
+      _showMessage('已删除归档索引');
+    } catch (e, stack) {
+      _logError('DeleteArchive', e, stack);
+      if (!mounted) return;
+      await _showErrorDialog('删除归档失败', '$e', stack);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   // ------------------------------------------------------------ 导出 / 导入
@@ -553,6 +1117,13 @@ class _HomePageState extends State<HomePage> {
       );
   }
 
+  /// 同时输出到控制台和日志文件：从资源管理器启动时没有控制台，
+  /// 只有写文件才能保留排错线索。
+  void _logError(String tag, Object error, StackTrace? stack) {
+    debugPrint('[$tag] $error\n$stack');
+    writeDiagnosticLog(tag, error, stack: stack);
+  }
+
   // ------------------------------------------------------------------ 界面
 
   @override
@@ -625,6 +1196,7 @@ class _HomePageState extends State<HomePage> {
       body: Column(
         children: [
           if (_scanning) _buildScanBanner(theme),
+          if (_archivedLibraryId != null) _buildArchivedBanner(theme),
           Expanded(
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -633,15 +1205,25 @@ class _HomePageState extends State<HomePage> {
                   width: 260,
                   child: FolderSidebar(
                     folders: _rootFolders,
+                    displayNames: _folderNames,
                     counts: _folderCounts,
                     totalCount: _totalCount,
-                    selectedRoot: _selectedRoot,
-                    allSelected: _scopePath == null,
+                    selectedRoot: _archivedLibraryId != null
+                        ? null
+                        : _selectedRoot,
+                    allSelected:
+                        _scopePath == null && _archivedLibraryId == null,
                     enabled: !_busy && !_scanning,
                     onSelect: (folder) => _navigateTo(folder),
                     onAdd: _addFolder,
                     onRescan: _scanFolder,
+                    onRename: _renameFolder,
                     onRemove: _removeFolder,
+                    archivedLibraries: _archivedLibraries,
+                    selectedArchivedId: _archivedLibraryId,
+                    onSelectArchived: _openArchived,
+                    onRestoreArchived: _restoreArchived,
+                    onDeleteArchived: _deleteArchived,
                   ),
                 ),
                 const VerticalDivider(width: 1),
@@ -711,7 +1293,44 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Widget _buildArchivedBanner(ThemeData theme) {
+    final library = _archivedLibrary;
+    if (library == null) return const SizedBox.shrink();
+    return Material(
+      color: theme.colorScheme.tertiaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+        child: Row(
+          children: [
+            Icon(
+              Icons.inventory_2_outlined,
+              size: 16,
+              color: theme.colorScheme.onTertiaryContainer,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '正在浏览已归档的「${library.name}」索引'
+                '（${library.photoCount} 张）· 只读浏览，不会改动当前活动索引',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onTertiaryContainer,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            TextButton(
+              onPressed: _openActiveScope,
+              child: const Text('返回当前索引'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildMainArea(ThemeData theme) {
+    final archived = _archivedLibrary;
     return Column(
       children: [
         Padding(
@@ -721,8 +1340,11 @@ class _HomePageState extends State<HomePage> {
               Expanded(
                 child: FolderBreadcrumb(
                   scopePath: _scopePath,
-                  rootPaths: _rootFolders,
-                  onSelect: (path) => _navigateTo(path),
+                  rootPaths: archived == null ? _rootFolders : [archived.path],
+                  displayNames: archived == null
+                      ? _folderNames
+                      : {archived.path: archived.name},
+                  onSelect: _navigateScope,
                 ),
               ),
               const SizedBox(width: 8),
@@ -865,7 +1487,7 @@ class _HomePageState extends State<HomePage> {
       }
       return FolderGrid(
         folders: _subFolders,
-        onOpen: (folder) => _navigateTo(folder.path, mode: ViewMode.photos),
+        onOpen: (folder) => _navigateScope(folder.path, mode: ViewMode.photos),
         onOpenLocation: (folder) => _openLocation(folder.path),
       );
     }
@@ -874,8 +1496,19 @@ class _HomePageState extends State<HomePage> {
       return const Center(child: CircularProgressIndicator());
     }
     if (_photos.isEmpty) {
+      final archived = _archivedLibrary;
       final hasFilter =
           _keyword.isNotEmpty || _scopePath != null || !_filter.isEmpty;
+      if (archived != null && !hasFilter) {
+        return _EmptyState(
+          icon: Icons.inventory_2_outlined,
+          title: '这份归档索引里没有照片',
+          description: '可以返回当前索引，或重新扫描对应的硬盘。',
+          actionLabel: '返回当前索引',
+          actionIcon: Icons.arrow_back,
+          onAction: _openActiveScope,
+        );
+      }
       return _EmptyState(
         icon: Icons.image_not_supported_outlined,
         title: hasFilter ? '没有匹配的照片' : '还没有索引任何照片',
@@ -907,14 +1540,41 @@ class _HomePageState extends State<HomePage> {
       onOpenLocation: (photo) => _openLocation(photo.path),
       scrollController: _scrollController,
       loadingMore: _loadingMore,
+      // "全部照片"跨库显示时，用角落标签区分同路径的不同硬盘副本。
+      showLibraryLabels: _archivedLibraryId == null && _scopePath == null,
     );
   }
 
   Future<void> _scanAllFolders() async {
     setState(() => _cancelRequested = false);
+    final skipped = <String>[];
     for (final folder in _rootFolders) {
       if (_cancelRequested) break;
-      await _scanFolder(folder, resetCancel: false);
+      final identity = identifyVolume(folder);
+      if (identity == null) {
+        // 盘符不在、盘未接：跳过；网络路径等识别不了但仍可访问的照旧扫描。
+        if (!Directory(folder).existsSync()) {
+          skipped.add('$folder（未接入）');
+          continue;
+        }
+        await _scanFolder(folder, resetCancel: false, checkVolume: false);
+        continue;
+      }
+
+      final stored = await _db.folderVolume(folder);
+      if (stored == null || !stored.isKnown) {
+        // 老库没有卷信息，批量扫描时不擅自合并，提示手动确认一次。
+        skipped.add('$folder（需先手动扫描确认硬盘）');
+        continue;
+      }
+      if (!stored.matches(identity)) {
+        skipped.add('$folder（盘符上不是索引时的硬盘）');
+        continue;
+      }
+      await _scanFolder(folder, resetCancel: false, checkVolume: false);
+    }
+    if (skipped.isNotEmpty && mounted) {
+      _showMessage('已跳过 ${skipped.length} 个目录：${skipped.join('；')}');
     }
   }
 }

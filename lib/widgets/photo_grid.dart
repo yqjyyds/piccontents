@@ -13,6 +13,7 @@ class PhotoGrid extends StatelessWidget {
     required this.onOpenLocation,
     required this.scrollController,
     required this.loadingMore,
+    this.showLibraryLabels = false,
   });
 
   final List<Photo> photos;
@@ -21,6 +22,9 @@ class PhotoGrid extends StatelessWidget {
   final ValueChanged<Photo> onOpenLocation;
   final ScrollController scrollController;
   final bool loadingMore;
+
+  /// 是否显示照片所属硬盘（"全部照片"跨库时用于区分同路径副本）。
+  final bool showLibraryLabels;
 
   @override
   Widget build(BuildContext context) {
@@ -49,6 +53,7 @@ class PhotoGrid extends StatelessWidget {
         return _PhotoTile(
           photo: photo,
           selected: identical(photo, selected),
+          showLibraryLabel: showLibraryLabels,
           onTap: () => onSelect(photo),
           onDoubleTap: () => onOpenLocation(photo),
         );
@@ -61,12 +66,14 @@ class _PhotoTile extends StatelessWidget {
   const _PhotoTile({
     required this.photo,
     required this.selected,
+    required this.showLibraryLabel,
     required this.onTap,
     required this.onDoubleTap,
   });
 
   final Photo photo;
   final bool selected;
+  final bool showLibraryLabel;
   final VoidCallback onTap;
   final VoidCallback onDoubleTap;
 
@@ -116,6 +123,12 @@ class _PhotoTile extends StatelessWidget {
                         top: 4,
                         child: _Badge(icon: Icons.place_outlined),
                       ),
+                    if (showLibraryLabel && photo.libraryLabel != null)
+                      Positioned(
+                        left: 4,
+                        top: 4,
+                        child: _TextBadge(text: photo.libraryLabel!),
+                      ),
                   ],
                 ),
               ),
@@ -149,6 +162,30 @@ class _PhotoTile extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _TextBadge extends StatelessWidget {
+  const _TextBadge({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 120),
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        text,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(color: Colors.white, fontSize: 10),
       ),
     );
   }

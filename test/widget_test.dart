@@ -1,14 +1,64 @@
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:image/image.dart' as img;
 import 'package:piccontents/models/app_settings.dart';
 import 'package:piccontents/models/photo.dart';
 import 'package:piccontents/models/photo_filter.dart';
 import 'package:piccontents/services/database_service.dart';
+import 'package:piccontents/services/image_codec.dart';
 import 'package:piccontents/services/image_indexer.dart';
+import 'package:piccontents/services/index_worker_pool.dart';
+import 'package:piccontents/services/volume_identity.dart';
 import 'package:piccontents/utils/formatters.dart';
+import 'package:piccontents/utils/index_paths.dart';
 
 void main() {
+  group('硬盘身份', () {
+    test('GUID 优先用于判断是否同一块盘', () {
+      const a = VolumeIdentity(guid: 'g1', serial: 1, label: '一号盘');
+      expect(a.matches(const VolumeIdentity(guid: 'g1', serial: 2)), isTrue);
+      expect(a.matches(const VolumeIdentity(guid: 'g2', serial: 1)), isFalse);
+      expect(a.matches(null), isFalse);
+    });
+
+    test('没有 GUID 时回退到卷序列号', () {
+      const a = VolumeIdentity(serial: 42);
+      expect(a.matches(const VolumeIdentity(serial: 42)), isTrue);
+      expect(a.matches(const VolumeIdentity(serial: 43)), isFalse);
+    });
+
+    test('显示名有兜底', () {
+      expect(const VolumeIdentity(guid: 'g').displayName, '未命名卷');
+      expect(
+        const VolumeIdentity(guid: 'g', label: ' 五号盘 ').displayName,
+        '五号盘',
+      );
+    });
+
+    test('能读取本机盘符的卷身份', () {
+      final identity = identifyVolume(r'C:\');
+      expect(identity, isNotNull);
+      expect(identity!.isUsable, isTrue);
+    });
+  });
+
+  group('索引目录路径', () {
+    test('盘符根统一成 C:\\ 形式', () {
+      expect(normalizeIndexRootPath('C:'), r'C:\');
+      expect(normalizeIndexRootPath('C:/'), r'C:\');
+      expect(normalizeIndexRootPath(r'c:\'), r'C:\');
+      expect(normalizeIndexRootPath(' d: '), r'D:\');
+    });
+
+    test('普通目录去掉末尾分隔符', () {
+      expect(normalizeIndexRootPath(r'D:\Photos'), r'D:\Photos');
+      expect(normalizeIndexRootPath(r'D:\Photos\'), r'D:\Photos');
+      expect(normalizeIndexRootPath('D:/Photos/2024/'), r'D:\Photos\2024');
+    });
+  });
+
   group('parseExifDate', () {
     test('解析标准 EXIF 时间', () {
       final millis = parseExifDate('2024:05:01 12:30:45');
@@ -511,6 +561,62 @@ void main() {
           ).isValid,
           isFalse,
         );
+      });
+    });
+
+    group('缩略图流水线', () {
+      test('worker 池解析 + 解码 + 编码产出正确尺寸', () async {
+        final dir = await Directory.systemTemp.createTemp('piccontents_test');
+        final file = File('${dir.path}${Platform.pathSeparator}a.jpg');
+        final source = img.Image(width: 800, height: 600);
+        await file.writeAsBytes(img.encodeJpg(source, quality: 90));
+
+        final pool = await IndexWorkerPool.start(workerCount: 2);
+        try {
+          const indexer = ImageIndexer(thumbnailSize: 200);
+          final photo = await indexer.indexImage(
+            file.path,
+            dir.path,
+            libraryId: 1,
+            pool: pool,
+          );
+
+          expect(photo, isNotNull);
+          // 分辨率必须来自解码得到的真实尺寸，而不是缩略图尺寸。
+          expect(photo!.width, 800);
+          expect(photo.height, 600);
+          expect(photo.thumbnail, isNotNull);
+
+          final thumb = img.decodeJpg(photo.thumbnail!);
+          expect(thumb, isNotNull);
+          expect(math.max(thumb!.width, thumb.height), 200);
+        } finally {
+          await pool.close();
+          await dir.delete(recursive: true);
+        }
+      });
+
+      test('损坏文件不会让任务挂死', () async {
+        final dir = await Directory.systemTemp.createTemp('piccontents_test');
+        final file = File('${dir.path}${Platform.pathSeparator}bad.jpg');
+        await file.writeAsBytes([0xFF, 0xD8, 0x00, 0x01, 0x02]);
+
+        final pool = await IndexWorkerPool.start(workerCount: 1);
+        try {
+          const indexer = ImageIndexer(thumbnailSize: 200);
+          final photo = await indexer.indexImage(
+            file.path,
+            dir.path,
+            libraryId: 1,
+            pool: pool,
+          );
+          // 仍应返回一条基础记录，只是没有缩略图。
+          expect(photo, isNotNull);
+          expect(photo!.thumbnail, isNull);
+        } finally {
+          await pool.close();
+          await dir.delete(recursive: true);
+        }
       });
     });
   });

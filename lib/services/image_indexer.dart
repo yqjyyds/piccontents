@@ -1,14 +1,14 @@
 import 'dart:io';
-import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:exif/exif.dart';
-import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 
 import '../models/photo.dart';
+import 'image_codec.dart';
+import 'index_worker_pool.dart';
+import 'scan_timings.dart';
 
 /// 支持索引的图片扩展名。
 const Set<String> kSupportedExtensions = {
@@ -34,6 +34,10 @@ bool isSupportedImage(String path) {
 }
 
 /// 负责把单个图片文件转换成带缩略图的 [Photo] 记录。
+///
+/// 分工：
+/// - 主 isolate：读文件、用引擎原生解码（`dart:ui` 只能在根 isolate 用）
+/// - worker 池：EXIF 解析、JPEG 编码（纯 Dart、CPU 密集）
 class ImageIndexer {
   const ImageIndexer({this.thumbnailSize = 400});
 
@@ -43,8 +47,11 @@ class ImageIndexer {
   Future<Photo?> indexImage(
     String path,
     String folderPath, {
+    required int libraryId,
+    required IndexWorkerPool pool,
     int? fileSize,
     int? fileModified,
+    ScanTimings? timings,
   }) async {
     final file = File(path);
     var size = fileSize ?? 0;
@@ -60,36 +67,49 @@ class ImageIndexer {
       }
     }
 
-    // EXIF 解析是同步 IO + 纯 Dart 计算，放进独立 isolate 以免卡住界面。
-    Map<String, Object?> exif = const {};
+    // 一次读盘同时供解码和 EXIF 使用：慢盘/坏块盘上第二次读文件是主要瓶颈。
+    Uint8List bytes;
+    final readWatch = Stopwatch()..start();
     try {
-      exif = await Isolate.run(() => readExifFacts(path));
+      bytes = await file.readAsBytes();
     } catch (_) {
-      exif = const {};
+      // 读不出来（坏块、权限、文件被删除）直接算失败，不写入半条记录。
+      timings?.readUs += readWatch.elapsedMicroseconds;
+      return null;
     }
+    timings?.readUs += readWatch.elapsedMicroseconds;
 
+    final decodeWatch = Stopwatch()..start();
+    final decoded = await decodeThumbnailSource(bytes, thumbnailSize);
+    timings?.decodeUs += decodeWatch.elapsedMicroseconds;
+
+    final exifResult = await _safeExif(pool, bytes);
+    timings?.exifUs += exifResult.microseconds;
+    final exif = exifResult.facts;
     final orientation = _asInt(exif['orientation']);
 
-    Uint8List? thumbnail;
     // EXIF 里的尺寸容易被二次编辑的软件写错或剥离，只作为解码失败时的兜底。
     int? width = _asInt(exif['imageWidth']);
     int? height = _asInt(exif['imageLength']);
-    try {
-      final bytes = await file.readAsBytes();
-      final result = await buildThumbnail(bytes, thumbnailSize, orientation);
-      if (result != null) {
-        thumbnail = result.bytes;
-        // 解码得到的才是文件真实分辨率。
-        width = result.originalWidth;
-        height = result.originalHeight;
+
+    Uint8List? thumbnail;
+    if (decoded != null) {
+      // 解码得到的才是文件真实分辨率。
+      width = decoded.originalWidth;
+      height = decoded.originalHeight;
+      try {
+        final encoded = await pool.runEncode(decoded, orientation);
+        timings?.encodeUs += encoded.microseconds;
+        thumbnail = encoded.thumbnail?.bytes;
+      } catch (_) {
+        thumbnail = null;
       }
-    } catch (_) {
-      // 无法解码时依旧保留元数据记录。
     }
 
     final fileName = path.split(RegExp(r'[\\/]')).last;
 
     return Photo(
+      libraryId: libraryId,
       path: path,
       fileName: fileName,
       folderPath: folderPath,
@@ -117,6 +137,18 @@ class ImageIndexer {
     );
   }
 
+  /// EXIF 失败不影响整条记录，返回空字典继续。
+  Future<({Map<String, Object?> facts, int microseconds})> _safeExif(
+    IndexWorkerPool pool,
+    Uint8List bytes,
+  ) async {
+    try {
+      return await pool.runExifBytes(bytes);
+    } catch (_) {
+      return (facts: const <String, Object?>{}, microseconds: 0);
+    }
+  }
+
   // ------------------------------------------------------------ 类型转换
 
   static String? _asString(Object? v) {
@@ -139,32 +171,12 @@ class ImageIndexer {
   }
 }
 
-/// 生成缩略图的结果。
-class ThumbnailResult {
-  const ThumbnailResult(
-    this.bytes,
-    this.width,
-    this.height,
-    this.originalWidth,
-    this.originalHeight,
-  );
-
-  final Uint8List bytes;
-
-  /// 缩略图自身尺寸（已按 EXIF 方向旋正）。
-  final int width;
-  final int height;
-
-  /// 原文件记录的真实像素尺寸（未按方向旋转），用于展示照片分辨率。
-  final int originalWidth;
-  final int originalHeight;
-}
-
-/// 使用引擎原生解码（快）拿到目标尺寸的 RGBA，再用纯 Dart 编码为 JPEG。
-Future<ThumbnailResult?> buildThumbnail(
+/// 用引擎原生解码把图片缩到目标尺寸，并取出 RGBA 像素。
+///
+/// 必须在主 isolate 调用；编码交给 worker 池。
+Future<DecodedThumbnail?> decodeThumbnailSource(
   Uint8List bytes,
   int maxSize,
-  int? orientation,
 ) async {
   ui.ImageDescriptor? descriptor;
   ui.Codec? codec;
@@ -194,25 +206,10 @@ Future<ThumbnailResult?> buildThumbnail(
     final rgba = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
     if (rgba == null) return null;
 
-    var decoded = img.Image.fromBytes(
-      width: image.width,
-      height: image.height,
-      bytes: rgba.buffer,
-      bytesOffset: rgba.offsetInBytes,
-      numChannels: 4,
-      order: img.ChannelOrder.rgba,
-    );
-
-    if (orientation != null && orientation > 1) {
-      decoded.exif.imageIfd.orientation = orientation;
-      decoded = img.bakeOrientation(decoded);
-    }
-
-    final encoded = img.encodeJpg(decoded, quality: 82);
-    return ThumbnailResult(
-      Uint8List.fromList(encoded),
-      decoded.width,
-      decoded.height,
+    return DecodedThumbnail(
+      rgba.buffer.asUint8List(rgba.offsetInBytes, rgba.lengthInBytes),
+      image.width,
+      image.height,
       originWidth,
       originHeight,
     );
@@ -222,152 +219,5 @@ Future<ThumbnailResult?> buildThumbnail(
     image?.dispose();
     codec?.dispose();
     descriptor?.dispose();
-  }
-}
-
-// ---------------------------------------------------------------- EXIF 解析
-
-/// 解析 EXIF，返回仅含基本类型的字典以便跨 isolate 传递。
-///
-/// 该函数是同步文件读写的，必须在独立 isolate 中调用。
-Future<Map<String, Object?>> readExifFacts(String path) async {
-  final result = <String, Object?>{};
-  Map<String, IfdTag> tags;
-  try {
-    tags = await readExifFromFile(File(path), details: false);
-  } catch (_) {
-    return result;
-  }
-  if (tags.isEmpty) return result;
-
-  String? text(String key) {
-    final value = tags[key]?.printable;
-    if (value == null) return null;
-    final trimmed = value.trim();
-    return trimmed.isEmpty ? null : trimmed;
-  }
-
-  double? ratio(String key) {
-    final values = tags[key]?.values;
-    if (values == null || values.length == 0) return null;
-    if (values is IfdRatios) {
-      final r = values.ratios.first;
-      if (r.denominator == 0) return null;
-      final d = r.toDouble();
-      return d.isFinite ? d : null;
-    }
-    return values.firstAsInt().toDouble();
-  }
-
-  int? integer(String key) {
-    final values = tags[key]?.values;
-    if (values == null || values.length == 0) return null;
-    return values.firstAsInt();
-  }
-
-  result['make'] = text('Image Make');
-  result['model'] = text('Image Model');
-  result['lensModel'] = text('EXIF LensModel') ?? text('EXIF Lens');
-  result['orientation'] = integer('Image Orientation');
-  result['imageWidth'] =
-      integer('Image ImageWidth') ?? integer('EXIF ExifImageWidth');
-  result['imageLength'] =
-      integer('Image ImageLength') ?? integer('EXIF ExifImageLength');
-  result['software'] = text('Image Software');
-
-  final dateText =
-      text('EXIF DateTimeOriginal') ??
-      text('EXIF DateTimeDigitized') ??
-      text('Image DateTime');
-  final captureMs = parseExifDate(dateText);
-  if (captureMs != null) result['captureTime'] = captureMs;
-
-  var fNumber = ratio('EXIF FNumber');
-  if (fNumber == null) {
-    // 没有 FNumber 时用 APEX 光圈值换算：F = sqrt(2)^Av
-    final apex = ratio('EXIF ApertureValue');
-    if (apex != null) fNumber = math.pow(math.sqrt2, apex).toDouble();
-  }
-  result['fNumber'] = fNumber;
-
-  var exposureTime = ratio('EXIF ExposureTime');
-  if (exposureTime == null) {
-    // 快门优先值时换算：t = 1 / 2^Tv
-    final apex = ratio('EXIF ShutterSpeedValue');
-    if (apex != null) {
-      final seconds = 1 / math.pow(2, apex);
-      exposureTime = seconds.isFinite ? seconds : null;
-    }
-  }
-  result['exposureTime'] = exposureTime;
-
-  result['iso'] =
-      integer('EXIF ISOSpeedRatings') ??
-      integer('EXIF PhotographicSensitivity');
-  result['focalLength'] = ratio('EXIF FocalLength');
-  result['focalLength35mm'] = ratio('EXIF FocalLengthIn35mmFilm');
-  result['exposureBias'] = ratio('EXIF ExposureBiasValue');
-  result['exposureProgram'] = text('EXIF ExposureProgram');
-  result['meteringMode'] = text('EXIF MeteringMode');
-  result['flash'] = text('EXIF Flash');
-  result['whiteBalance'] = text('EXIF WhiteBalance');
-
-  final lat = _gpsToDecimal(tags, 'GPS GPSLatitude', 'GPS GPSLatitudeRef');
-  final lon = _gpsToDecimal(tags, 'GPS GPSLongitude', 'GPS GPSLongitudeRef');
-  if (lat != null) result['gpsLat'] = lat;
-  if (lon != null) result['gpsLon'] = lon;
-
-  final altitude = ratio('GPS GPSAltitude');
-  if (altitude != null) {
-    final belowSea = integer('GPS GPSAltitudeRef') == 1;
-    result['gpsAltitude'] = belowSea ? -altitude : altitude;
-  }
-
-  return result;
-}
-
-double? _gpsToDecimal(
-  Map<String, IfdTag> tags,
-  String valueKey,
-  String refKey,
-) {
-  final values = tags[valueKey]?.values;
-  if (values is! IfdRatios || values.ratios.length < 3) return null;
-  final degrees = values.ratios[0].denominator == 0
-      ? 0.0
-      : values.ratios[0].toDouble();
-  final minutes = values.ratios[1].denominator == 0
-      ? 0.0
-      : values.ratios[1].toDouble();
-  final seconds = values.ratios[2].denominator == 0
-      ? 0.0
-      : values.ratios[2].toDouble();
-  var decimal = degrees + minutes / 60 + seconds / 3600;
-  if (!decimal.isFinite) return null;
-  final ref = tags[refKey]?.printable.trim().toUpperCase();
-  if (ref == 'S' || ref == 'W') decimal = -decimal;
-  return decimal;
-}
-
-/// 解析 EXIF 日期字符串，例如 `2024:05:01 12:30:45`。
-int? parseExifDate(String? value) {
-  if (value == null) return null;
-  final match = RegExp(
-    r'(\d{4})[:\-/](\d{1,2})[:\-/](\d{1,2})[ T](\d{1,2}):(\d{1,2}):(\d{1,2})',
-  ).firstMatch(value);
-  if (match == null) return null;
-  final year = int.parse(match.group(1)!);
-  if (year < 1826 || year > 2200) return null;
-  try {
-    return DateTime(
-      year,
-      int.parse(match.group(2)!),
-      int.parse(match.group(3)!),
-      int.parse(match.group(4)!),
-      int.parse(match.group(5)!),
-      int.parse(match.group(6)!),
-    ).millisecondsSinceEpoch;
-  } catch (_) {
-    return null;
   }
 }

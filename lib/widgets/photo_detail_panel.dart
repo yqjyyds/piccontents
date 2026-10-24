@@ -102,6 +102,8 @@ class PhotoDetailPanel extends StatelessWidget {
                     value: photo.folderPath,
                     selectable: true,
                   ),
+                  if (photo.libraryLabel != null)
+                    _InfoRow(label: '来源硬盘', value: photo.libraryLabel!),
                   _InfoRow(label: '文件大小', value: formatBytes(photo.fileSize)),
                   _InfoRow(
                     label: '文件修改时间',

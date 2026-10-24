@@ -1,23 +1,39 @@
+import 'dart:io';
+
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 
 import '../models/app_settings.dart';
 import '../models/photo_filter.dart';
 import '../utils/formatters.dart';
+import '../utils/index_paths.dart';
 
-/// 设置对话框的返回值。[bounds] 为 null 表示恢复成"按实际数据范围"。
-class SliderBoundsResult {
-  const SliderBoundsResult(this.bounds);
+/// 设置对话框的返回值。
+///
+/// [boundsChanged] 为 false 表示用户没有改动滑条范围；此时 [bounds]
+/// 即使为 null 也不应被当作"恢复数据范围"。
+class SettingsResult {
+  const SettingsResult({
+    this.bounds,
+    this.boundsChanged = false,
+    this.newDataDir,
+  });
 
   final SliderBounds? bounds;
+  final bool boundsChanged;
+
+  /// 用户新选择的数据目录；null 表示没有改动。
+  final String? newDataDir;
 }
 
-/// 滑条极值设置：让用户自己指定光圈 / 快门 / ISO 的可调范围，
-/// 从而可以输入超出当前数据范围的条件。
+/// 设置对话框：滑条极值 + 索引文件保存位置。
 class SliderBoundsDialog extends StatefulWidget {
   const SliderBoundsDialog({
     super.key,
     required this.effectiveOptions,
     required this.currentBounds,
+    this.dataPath,
   });
 
   /// 当前界面实际使用的取值范围，用于预填。
@@ -25,6 +41,9 @@ class SliderBoundsDialog extends StatefulWidget {
 
   /// 已保存的设置；null 表示当前按实际数据范围。
   final SliderBounds? currentBounds;
+
+  /// 当前数据库文件所在位置，便于确认数据落在哪里。
+  final String? dataPath;
 
   @override
   State<SliderBoundsDialog> createState() => _SliderBoundsDialogState();
@@ -39,6 +58,16 @@ class _SliderBoundsDialogState extends State<SliderBoundsDialog> {
   late final TextEditingController _isoMax;
 
   String? _error;
+
+  /// 用户新选择的数据目录；null 表示沿用当前位置。
+  String? _newDataDir;
+  String? _dataError;
+
+  String? get _effectiveDataPath {
+    final dir = _newDataDir;
+    if (dir != null) return p.join(dir, 'piccontents_library.db');
+    return widget.dataPath;
+  }
 
   @override
   void initState() {
@@ -122,8 +151,8 @@ class _SliderBoundsDialogState extends State<SliderBoundsDialog> {
 
     Navigator.pop(
       context,
-      SliderBoundsResult(
-        SliderBounds(
+      SettingsResult(
+        bounds: SliderBounds(
           fNumberMin: fMin,
           fNumberMax: fMax,
           exposureMin: eMin,
@@ -131,8 +160,37 @@ class _SliderBoundsDialogState extends State<SliderBoundsDialog> {
           isoMin: iMin,
           isoMax: iMax,
         ),
+        boundsChanged: true,
+        newDataDir: _newDataDir,
       ),
     );
+  }
+
+  Future<void> _pickDataDir() async {
+    try {
+      final path = await getDirectoryPath(confirmButtonText: '使用该文件夹');
+      if (path == null || !mounted) return;
+      setState(() {
+        _newDataDir = normalizeIndexRootPath(path);
+        _dataError = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _dataError = '选择文件夹失败：$e');
+    }
+  }
+
+  Future<void> _openDataDir() async {
+    final dataPath = _effectiveDataPath;
+    if (dataPath == null) return;
+    try {
+      await Process.start('explorer.exe', [
+        p.dirname(dataPath),
+      ], mode: ProcessStartMode.detached);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _dataError = '无法打开文件夹：$e');
+    }
   }
 
   @override
@@ -210,6 +268,66 @@ class _SliderBoundsDialogState extends State<SliderBoundsDialog> {
                   ],
                 ),
               ],
+              const Divider(height: 24),
+              Text(
+                '索引文件位置',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  color: theme.colorScheme.primary,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '缩略图与 EXIF 索引都保存在这个数据库文件里。'
+                '更改位置只会迁移索引，不会动原始照片。',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.hintColor,
+                ),
+              ),
+              const SizedBox(height: 8),
+              SelectableText(
+                _effectiveDataPath ?? '未知（数据库尚未初始化）',
+                style: theme.textTheme.labelSmall,
+              ),
+              if (_newDataDir != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    '保存后会立即把索引迁移到新位置。',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 4,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: _pickDataDir,
+                    icon: const Icon(
+                      Icons.drive_folder_upload_outlined,
+                      size: 16,
+                    ),
+                    label: Text(_newDataDir == null ? '更改位置…' : '重新选择…'),
+                  ),
+                  TextButton.icon(
+                    onPressed: _effectiveDataPath == null ? null : _openDataDir,
+                    icon: const Icon(Icons.folder_open_outlined, size: 16),
+                    label: const Text('打开所在文件夹'),
+                  ),
+                ],
+              ),
+              if (_dataError != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text(
+                    _dataError!,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.error,
+                    ),
+                  ),
+                ),
             ],
           ),
         ),
@@ -217,7 +335,10 @@ class _SliderBoundsDialogState extends State<SliderBoundsDialog> {
       actions: [
         TextButton(
           onPressed: isCustom
-              ? () => Navigator.pop(context, const SliderBoundsResult(null))
+              ? () => Navigator.pop(
+                  context,
+                  const SettingsResult(boundsChanged: true),
+                )
               : null,
           child: const Text('恢复数据范围'),
         ),

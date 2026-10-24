@@ -4,6 +4,12 @@ import 'dart:typed_data';
 class Photo {
   final int? id;
 
+  /// 所属索引库（一块硬盘一份索引）。
+  final int? libraryId;
+
+  /// 所属硬盘的显示名（查询时关联得到，用于区分同路径的不同硬盘）。
+  final String? libraryLabel;
+
   /// 照片的绝对路径。
   final String path;
   final String fileName;
@@ -50,6 +56,8 @@ class Photo {
 
   Photo({
     this.id,
+    this.libraryId,
+    this.libraryLabel,
     required this.path,
     required this.fileName,
     required this.folderPath,
@@ -123,6 +131,7 @@ class Photo {
 
   Map<String, Object?> toMap() => {
     if (id != null) 'id': id,
+    if (libraryId != null) 'library_id': libraryId,
     'path': path,
     'file_name': fileName,
     'folder_path': folderPath,
@@ -153,6 +162,8 @@ class Photo {
     final captureMs = map['capture_time'] as int?;
     return Photo(
       id: map['id'] as int?,
+      libraryId: map['library_id'] as int?,
+      libraryLabel: map['library_label'] as String?,
       path: map['path'] as String,
       fileName: map['file_name'] as String? ?? '',
       folderPath: map['folder_path'] as String? ?? '',

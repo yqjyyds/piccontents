@@ -8,6 +8,7 @@ class FolderBreadcrumb extends StatelessWidget {
     required this.scopePath,
     required this.rootPaths,
     required this.onSelect,
+    this.displayNames = const {},
   });
 
   /// 当前所在目录；null 表示"全部照片"。
@@ -16,12 +17,15 @@ class FolderBreadcrumb extends StatelessWidget {
   /// 已索引的根目录列表。
   final List<String> rootPaths;
 
+  /// 索引目录的自定义显示名（路径 → 名称）。
+  final Map<String, String> displayNames;
+
   final ValueChanged<String?> onSelect;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final crumbs = _buildCrumbs(scopePath, rootPaths);
+    final crumbs = _buildCrumbs(scopePath, rootPaths, displayNames);
     return SizedBox(
       height: 34,
       child: SingleChildScrollView(
@@ -44,13 +48,17 @@ class FolderBreadcrumb extends StatelessWidget {
     );
   }
 
-  static List<_Crumb> _buildCrumbs(String? scope, List<String> roots) {
+  static List<_Crumb> _buildCrumbs(
+    String? scope,
+    List<String> roots,
+    Map<String, String> displayNames,
+  ) {
     final crumbs = <_Crumb>[const _Crumb(label: '全部照片', path: null)];
     if (scope == null || scope.isEmpty) return crumbs;
 
     final root = _bestRoot(scope, roots);
     if (root != null) {
-      crumbs.add(_Crumb(label: _name(root), path: root));
+      crumbs.add(_Crumb(label: displayNames[root] ?? _name(root), path: root));
       var accumulated = root;
       for (final part in _relativeParts(scope, root)) {
         accumulated = p.join(accumulated, part);
